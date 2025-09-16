@@ -153,6 +153,44 @@ def check_ftmo_violations(balance, starting_balance, daily_start_balance, phase,
     return violations, account_closed
 
 
+def manage_daily_loss_circuit_breaker(open_trades, daily_loss_pct, current_price, thresholds):
+    """Enhanced circuit breaker that actively manages open positions"""
+    actions_taken = []
+    
+    if daily_loss_pct >= thresholds['emergency']:
+        # Emergency: Close ALL positions immediately
+        for trade in open_trades[:]:  # Use slice to avoid modification during iteration
+            trade['force_close'] = True
+            trade['exit_price'] = current_price
+            trade['exit_reason'] = 'EMERGENCY_CIRCUIT_BREAKER'
+            actions_taken.append(f'Emergency close position at {current_price}')
+    
+    elif daily_loss_pct >= thresholds['critical']:
+        # Critical: Close weakest performing positions
+        if len(open_trades) > 1:
+            # Sort by floating P&L and close worst performing
+            open_trades.sort(key=lambda t: (current_price - t['entry_price']) * t['position_size'])
+            worst_trade = open_trades[0]
+            worst_trade['force_close'] = True
+            worst_trade['exit_price'] = current_price
+            worst_trade['exit_reason'] = 'CRITICAL_CIRCUIT_BREAKER'
+            actions_taken.append(f'Critical close worst position at {current_price}')
+    
+    elif daily_loss_pct >= thresholds['warning']:
+        # Warning: Tighten stops and reduce new position sizes
+        for trade in open_trades:
+            if not hasattr(trade, 'stop_tightened'):
+                # Tighten stop loss closer to break-even
+                current_stop = trade['sl']
+                entry_price = trade['entry_price']
+                tighter_stop = entry_price - (entry_price - current_stop) * 0.5  # Move stop 50% closer
+                trade['sl'] = max(current_stop, tighter_stop)  # Don't worsen the stop
+                trade['stop_tightened'] = True
+                actions_taken.append(f'Tightened stop from {current_stop:.1f} to {trade["sl"]:.1f}')
+    
+    return actions_taken
+
+
 def generate_signals(df, s, tp_ratio):
     # Get hour values
     df["Hour"] = df.index.hour
@@ -182,13 +220,12 @@ def generate_signals(df, s, tp_ratio):
 def generate_ftmo_trades(df, s, mult):
     # Create empty list for trades
     trades_list = []
-    trade_open = False
+    open_trades = []  # Track multiple open positions
     open_change = {}
     balance = starting_balance
     equity = starting_balance
     balance_history = []
     equity_history = []
-    trailing = False
     
     # FTMO tracking
     days_traded = 0
@@ -197,6 +234,14 @@ def generate_ftmo_trades(df, s, mult):
     ftmo_violations = []
     account_closed = False
     phase_history = []
+    
+    # Enhanced daily loss protection settings
+    max_concurrent_positions = 2
+    circuit_breaker_thresholds = {
+        'warning': 0.025,    # 2.5% - reduce position sizes
+        'critical': 0.035,   # 3.5% - force close weakest positions  
+        'emergency': 0.045   # 4.5% - close all positions
+    }
 
     # Extract numpy arrays for relevant columns
     open_prices = df['Open'].values
@@ -225,6 +270,17 @@ def generate_ftmo_trades(df, s, mult):
         current_phase = get_trading_phase(balance, starting_balance, days_traded)
         phase_history.append(current_phase)
         
+        # Calculate current daily loss for circuit breaker
+        daily_loss_pct = (daily_start_balance - balance) / starting_balance if daily_start_balance > 0 else 0
+        
+        # Enhanced Circuit Breaker Management
+        if open_trades and daily_loss_pct > 0:
+            circuit_actions = manage_daily_loss_circuit_breaker(
+                open_trades, daily_loss_pct, close_prices[i], circuit_breaker_thresholds
+            )
+            if circuit_actions:
+                print(f"Circuit Breaker Activated on {current_timestamp}: {circuit_actions}")
+        
         # Check FTMO violations
         if not account_closed:
             violations, closed = check_ftmo_violations(
@@ -237,20 +293,28 @@ def generate_ftmo_trades(df, s, mult):
                 print(f"FTMO Account Closed on {current_timestamp}: {violations}")
                 break
         
-        # If there is currently no trade and account is not closed
-        if not account_closed and not trade_open and signal_values[i]:
-            # Calculate daily loss to prevent breaching 5% limit
-            daily_loss_pct = (daily_start_balance - balance) / starting_balance if daily_start_balance > 0 else 0
+        # Entry logic for new positions
+        if not account_closed and len(open_trades) < max_concurrent_positions and signal_values[i]:
             max_additional_risk = ftmo.challenge_daily_loss_limit - daily_loss_pct - 0.005  # 0.5% buffer
             
-            # Only take trade if we have enough daily loss buffer (at least 1.5% remaining)
-            if max_additional_risk >= 0.015:
+            # Enhanced entry restrictions
+            entry_allowed = (
+                max_additional_risk >= 0.015 and  # At least 1.5% daily risk remaining
+                daily_loss_pct < circuit_breaker_thresholds['warning']  # No new entries if already in warning zone
+            )
+            
+            if entry_allowed:
                 entry_date = index_values[i]
                 entry_price = open_prices[i]
                 sl = sl_values[i]
                 tp = tp_values[i]
                 # Calculate position size based on risk percentage, adjusted for daily loss protection and trading costs
                 base_risk = min(risk_per_trade, max_additional_risk)
+                
+                # Position scaling based on multiple open trades
+                if len(open_trades) >= 1:
+                    base_risk *= 0.75  # Reduce risk when multiple positions
+                
                 risk_amount = balance * base_risk
                 
                 # Calculate stop loss distance and adjust for trading costs
@@ -263,72 +327,125 @@ def generate_ftmo_trades(df, s, mult):
                     position_size = max(0.01, preliminary_position_size)  # Minimum position size
                 else:
                     position_size = 0.01
-                trade_open = True
-                trailing = False
+                
+                # Create new trade object and add to open_trades list
+                new_trade = {
+                    'entry_date': entry_date,
+                    'entry_price': entry_price,
+                    'sl': sl,
+                    'tp': tp,
+                    'position_size': position_size,
+                    'trailing': False,
+                    'force_close': False,
+                    'exit_reason': None
+                }
+                open_trades.append(new_trade)
             
-        # Check if a trade is already open and account not closed
-        if trade_open and not account_closed:
-            # Get price values
+        # Process all open trades
+        total_floating_pnl = 0
+        for trade in open_trades[:]:  # Use slice to avoid modification during iteration
+            # Get current price values
             low = low_prices[i]
             high = high_prices[i]
-            open = open_prices[i]
+            open_price = open_prices[i]
             close = close_prices[i]
             last_candle = last_candle_values[i]
-
-            # Calculate unrealized PnL
-            floating_pnl = (high - entry_price) * position_size
-            equity = balance + floating_pnl  # Update equity dynamically
-
-            # Check if stop is hit
-            if low <= sl:
-                exit_price = open if open <= sl else sl
-                trade_open = False
-
-            # Now do the same check for take profit
+            
+            # Extract trade details
+            entry_price = trade['entry_price']
+            sl = trade['sl']
+            tp = trade['tp']
+            position_size = trade['position_size']
+            
+            # Calculate unrealized PnL for this trade
+            floating_pnl = (close - entry_price) * position_size
+            total_floating_pnl += floating_pnl
+            
+            # Check exit conditions
+            should_exit = False
+            exit_price = None
+            exit_reason = 'NORMAL'
+            
+            # 1. Circuit breaker forced close
+            if trade.get('force_close', False):
+                should_exit = True
+                exit_price = trade.get('exit_price', close)
+                exit_reason = trade.get('exit_reason', 'CIRCUIT_BREAKER')
+            
+            # 2. Stop loss hit
+            elif low <= sl:
+                should_exit = True
+                exit_price = open_price if open_price <= sl else sl
+                exit_reason = 'STOP'
+            
+            # 3. Take profit hit
             elif high >= tp:
                 if trailing_stop:
-                    trailing = True
+                    trade['trailing'] = True
                     if take_partial:
-                        partial_exit_price = open if open >= tp else tp
-                        position_size *= 0.5
-                        pnl = (partial_exit_price - entry_price) * position_size  # PnL in currency terms
-                        balance += pnl  # Update balance with PnL
-                    tp = 100000000000
+                        # Partial exit logic (simplified for multi-position)
+                        exit_price = open_price if open_price >= tp else tp
+                        trade['position_size'] *= 0.5  # Reduce position size
+                        # Calculate partial P&L
+                        if trade_direction == "long":
+                            raw_pnl = (exit_price - entry_price) * (position_size * 0.5)
+                        else:
+                            raw_pnl = -1 * (exit_price - entry_price) * (position_size * 0.5)
+                        
+                        # Deduct trading costs
+                        points_cost = (position_size * 0.5) * points_cost_per_contract
+                        total_trading_costs = points_cost + commission_cost_per_contract
+                        pnl = raw_pnl - total_trading_costs
+                        balance += pnl
+                        
+                        # Update take profit to very high level for remaining position
+                        trade['tp'] = 100000000000
+                    else:
+                        should_exit = True
+                        exit_price = open_price if open_price >= tp else tp
+                        exit_reason = 'TARGET'
                 else:
-                    exit_price = open if open >= tp else tp
-                    trade_open = False
-
+                    should_exit = True
+                    exit_price = open_price if open_price >= tp else tp  
+                    exit_reason = 'TARGET'
+            
+            # 4. End of day exit (if enabled)
             elif exit_eod and not ftmo.weekend_holding_allowed:
                 if (index_values[i].time() == market_close_time) or last_candle:
-                    exit_price = close  # Close at the market close price
-                    trade_open = False
-
-            # Update trailing stop
-            elif trailing:
-                new_stop = open - (prev_atr_values[i] * mult)
+                    should_exit = True
+                    exit_price = close
+                    exit_reason = 'EOD'
+            
+            # 5. Update trailing stop
+            elif trade.get('trailing', False):
+                new_stop = open_price - (prev_atr_values[i] * mult)
                 if new_stop > sl:
-                    sl = new_stop
-
-            if not trade_open:  # If trade has been closed
+                    trade['sl'] = new_stop
+            
+            # Process exit if needed
+            if should_exit:
                 exit_date = index_values[i]
-                trade_open = False
-
-                if trade_direction == "long":   
-                    raw_pnl = (exit_price - entry_price) * position_size  # Raw P&L in currency terms
-                elif trade_direction == "short":
-                    raw_pnl = -1 * (exit_price - entry_price) * position_size  # Raw P&L in currency terms
                 
-                # Deduct trading costs (spread + slippage + commission)
-                points_cost = position_size * points_cost_per_contract  # Cost in points
-                commission_cost = commission_cost_per_contract  # Fixed commission per trade
-                total_trading_costs = points_cost + commission_cost
-                pnl = raw_pnl - total_trading_costs  # Net P&L after costs
-                balance += pnl  # Update balance with net P&L             
-
-                # Store trade data in a list
-                trade = [entry_date, entry_price, exit_date, exit_price, position_size, pnl, balance, True, current_phase]
-                # Append trade to overall trade list
-                trades_list.append(trade)
+                if trade_direction == "long":   
+                    raw_pnl = (exit_price - entry_price) * position_size
+                elif trade_direction == "short":
+                    raw_pnl = -1 * (exit_price - entry_price) * position_size
+                
+                # Deduct trading costs
+                points_cost = position_size * points_cost_per_contract
+                total_trading_costs = points_cost + commission_cost_per_contract
+                pnl = raw_pnl - total_trading_costs
+                balance += pnl
+                
+                # Store completed trade
+                completed_trade = [trade['entry_date'], entry_price, exit_date, exit_price, position_size, pnl, balance, True, current_phase]
+                trades_list.append(completed_trade)
+                
+                # Remove from open trades
+                open_trades.remove(trade)
+        
+        # Update equity with total floating P&L
+        equity = balance + total_floating_pnl
 
         # Store balance and equity
         balance_history.append(balance)
@@ -347,22 +464,27 @@ def generate_ftmo_trades(df, s, mult):
         
         trades[f"{s}_Duration"] = dur
 
-        # Create a new dataframe with an index of exit dates
-        returns = pd.DataFrame(index=trades.Exit_Date)
-        # Create a new dataframe with an index of entries to track entry price
-        entries = pd.DataFrame(index=trades.Entry_Date)
-
-        entries[f"{s}_Entry_Price"] = pd.Series(trades.Entry_Price).values
-        # Add the Return column to this new data frame
-        returns[f"{s}_Ret"] = pd.Series(trades[f"{s}_Return"]).values
-        returns[f"{s}_Trade"] = pd.Series(trades.Sys_Trade).values
-        returns[f"{s}_Duration"] = pd.Series(trades[f"{s}_Duration"]).values
-        returns[f"{s}_PnL"] = pd.Series(trades.PnL).values
-        returns[f"{s}_Balance"] = pd.Series(trades.Balance).values
+        # Create aggregated returns by date to handle multiple trades per day
+        exit_data = trades.groupby('Exit_Date').agg({
+            f'{s}_Return': 'prod',  # Multiply returns for same day
+            'Sys_Trade': 'any',     # True if any trade on this day
+            f'{s}_Duration': 'mean', # Average duration
+            'PnL': 'sum',           # Sum P&L for same day
+            'Balance': 'last'       # Take final balance
+        })
+        
+        # Rename columns to match expected format
+        exit_data.columns = [f'{s}_Ret', f'{s}_Trade', f'{s}_Duration', f'{s}_PnL', f'{s}_Balance']
+        
+        entry_data = trades.groupby('Entry_Date').agg({
+            'Entry_Price': 'mean'   # Average entry price for same day
+        })
+        entry_data.columns = [f'{s}_Entry_Price']
+        
         change_ser = pd.Series(open_change, name=f"{s}_Change")
 
-        # Add the returns from the trades to the main data frame
-        df = pd.concat([df, returns, entries, change_ser], axis=1)
+        # Add the aggregated data to the main dataframe
+        df = pd.concat([df, exit_data, entry_data, change_ser], axis=1)
     
     # Fill all the NaN return values with 1 as there was no profit or loss on those days
     df[f"{s}_Ret"] = df[f"{s}_Ret"].fillna(1) if f"{s}_Ret" in df.columns else 1
